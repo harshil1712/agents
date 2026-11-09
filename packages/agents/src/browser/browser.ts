@@ -33,6 +33,11 @@ import {
 } from "./internal-hosts";
 import type { BrowserLiveView, LiveViewMode } from "./live-view";
 import {
+  SavedLoginsController,
+  type BrowserLogins,
+  type SavedLoginsOptions
+} from "./logins";
+import {
   browserRunAdapter,
   type BrowserRunProvider
 } from "./providers/browser-run";
@@ -138,6 +143,12 @@ export interface BrowserOptions {
   store?: ListableBrowserSessionStore;
   /** Default CDP command timeout for {@link Browser.connect}. */
   timeoutMs?: number;
+  /**
+   * Sites a person can save a login for, restored every time the browser
+   * is replaced. Manage them with {@link Browser.logins}. Needs the
+   * `Browser` installed with `Lifecycle.use()`.
+   */
+  logins?: SavedLoginsOptions;
   /**
    * Minimum interval between activity-driven `updatedAt` refreshes.
    * Defaults to {@link SESSION_TOUCH_INTERVAL_MS}, capped at half the
@@ -253,6 +264,7 @@ export class Browser extends LifecycleCapability {
   readonly #options: BrowserOptions;
   readonly #key: string;
   readonly #adapter: BrowserProviderAdapter;
+  readonly #logins?: SavedLoginsController;
   #store?: ListableBrowserSessionStore;
 
   constructor(options: BrowserOptions) {
@@ -265,6 +277,37 @@ export class Browser extends LifecycleCapability {
     this.#options = options;
     this.#key = namedBrowserSessionKey(name);
     this.#adapter = providerAdapterFor(options.provider);
+    if (options.logins) {
+      this.#logins = new SavedLoginsController(options.logins, {
+        name,
+        adapter: this.#adapter,
+        services: () => {
+          const services = this.lifecycleServices;
+          if (!services) {
+            throw new Error(
+              `Browser "${name}" has saved logins, which need it installed with Lifecycle.use()`
+            );
+          }
+          return services;
+        },
+        appliedVersion: async (sessionId) => {
+          const current = await this.#sessionStore.get(this.#key);
+          return current?.sessionId === sessionId
+            ? current.loginsVersion
+            : undefined;
+        },
+        close: () => this.close()
+      });
+    }
+  }
+
+  /**
+   * The browser's saved logins, or `undefined` when it has none. Host-side:
+   * begin and save logins for a person, list and revoke them. Never hand it
+   * to the model.
+   */
+  get logins(): BrowserLogins | undefined {
+    return this.#logins;
   }
 
   /**
@@ -347,6 +390,7 @@ export class Browser extends LifecycleCapability {
       cdp = await this.#open(resolved);
     }
     try {
+      await this.#applyLogins(resolved.sessionId, cdp);
       const entered = await this.#enterScope(scope, resolved.sessionId);
       return this.#connection(resolved, scope, cdp, entered);
     } catch (error) {
@@ -373,7 +417,7 @@ export class Browser extends LifecycleCapability {
    * about how your code runs (timeouts, screenshots) yourself.
    */
   functionDocs(): BrowserFunctionDocs {
-    return browserFunctionDocs(this.internalHosts);
+    return browserFunctionDocs(this.internalHosts, this.logins);
   }
 
   #connection(
@@ -677,6 +721,28 @@ export class Browser extends LifecycleCapability {
         error
       );
     }
+  }
+
+  // ── Saved logins ─────────────────────────────────────────────────────────
+
+  /**
+   * Give the browser the saved logins it doesn't have yet, before the
+   * connection is handed out. The record says which saved-logins version the
+   * browser got: a replaced browser's record starts without one, and every
+   * save and revoke bumps it. Applying is idempotent, so connects that race
+   * to a new browser may both apply.
+   */
+  async #applyLogins(sessionId: string, cdp: CdpConnection): Promise<void> {
+    if (!this.#logins) return;
+    const version = await this.#logins.version();
+    const current = await this.#sessionStore.get(this.#key);
+    if (current?.sessionId !== sessionId) return; // replaced meanwhile
+    if (current.loginsVersion === version) return;
+    await this.#logins.apply(cdp);
+    await this.#update(sessionId, (record) => ({
+      ...record,
+      loginsVersion: version
+    }));
   }
 
   // ── Internals ────────────────────────────────────────────────────────────

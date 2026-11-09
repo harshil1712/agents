@@ -187,6 +187,10 @@ export function browserRunAdapter(
       }
     },
 
+    createLoginSession({ keepAliveMs }) {
+      return acquireBrowserSession(binding, { keepAliveMs });
+    },
+
     async isAlive(sessionId) {
       try {
         await listBrowserTargets(binding, sessionId);

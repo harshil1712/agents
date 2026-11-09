@@ -31,6 +31,7 @@ import {
   type BrowserFunction,
   type SessionHosts
 } from "./browser-functions";
+import { savedLoginRefusal, type BrowserSessionLogins } from "./logins";
 import { DEFAULT_BROWSER_SCOPE } from "./scope";
 import type { SearchableCdpSpec } from "./spec";
 import { validate } from "./validate";
@@ -53,6 +54,12 @@ export interface BrowserSource {
    * and {@link BrowserSession.functions} adds the hosts functions.
    */
   readonly internalHosts?: BrowserInternalHosts;
+  /**
+   * The browser's saved logins, when it has any. Sessions then refuse the
+   * commands that read or write cookies and storage, redact saved values
+   * from what they return, and offer `browser.listLogins()`.
+   */
+  readonly logins?: BrowserSessionLogins;
 }
 
 export interface BrowserSessionOptions {
@@ -151,6 +158,11 @@ export interface BrowserSessionReport {
   /** Another scope is working in this scope's active tab too. */
   tabShared: boolean;
   /**
+   * The labels of the saved logins the browser was signed in to again
+   * after a restart. Absent when it wasn't restarted or has none.
+   */
+  restoredLogins?: string[];
+  /**
    * The report as sentences for the model, one per thing that happened,
    * empty when nothing did. Show them after the run's result.
    */
@@ -166,10 +178,17 @@ const TAB_CLOSED_NOTICE =
 const TAB_SHARED_NOTICE =
   "Another conversation using this browser is also working in your tab, so its page may change between your runs. Open a tab of your own with Target.createTarget if you need one.";
 
+function restartedWithLoginsNotice(labels: string[]): string {
+  return `The browser was restarted before this run (it expired or was closed): earlier tabs and page state are gone, and it was signed in again to the saved logins (${labels.join(", ")}). Your code ran in a fresh browser — navigate again before relying on page state.`;
+}
+
 /** What the report says, in sentences the model reads. */
 function reportNotices(report: Omit<BrowserSessionReport, "notices">) {
   return [
-    report.restarted && RESTARTED_NOTICE,
+    report.restarted &&
+      (report.restoredLogins?.length
+        ? restartedWithLoginsNotice(report.restoredLogins)
+        : RESTARTED_NOTICE),
     report.tabClosed && !report.restarted && TAB_CLOSED_NOTICE,
     report.tabShared && TAB_SHARED_NOTICE,
     report.newTabs.length > 0 &&
@@ -422,6 +441,11 @@ export class BrowserSession {
   #heldLock?: LockQueue;
   /** Aborts this session's wait for the lock when it closes. */
   readonly #closing = new AbortController();
+  /**
+   * Redacts the browser's saved values, from the first connect. Kept after
+   * close, so `redact()` still covers the run's final output.
+   */
+  #redact?: <T>(value: T) => T;
   #waitedForLockMs = 0;
 
   constructor(browser: BrowserSource, options: BrowserSessionOptions = {}) {
@@ -440,7 +464,7 @@ export class BrowserSession {
    */
   get functions(): Readonly<Record<string, BrowserFunction>> {
     this.#functions ??= Object.freeze(
-      browserFunctions(this, this.#sessionHosts())
+      browserFunctions(this, this.#sessionHosts(), this.#sessionLogins())
     );
     return this.#functions;
   }
@@ -527,7 +551,9 @@ export class BrowserSession {
       SEND_SCHEMA,
       input
     ) as BrowserSendInput;
-    const refused = REFUSED_COMMANDS.get(method);
+    const refused =
+      REFUSED_COMMANDS.get(method) ??
+      (this.#browser.logins ? savedLoginRefusal(method) : undefined);
     if (refused) throw new Error(`${method} is not available: ${refused}`);
     const state = await this.#connect();
     const live = await this.#resolveSessionId(state, sessionId);
@@ -540,11 +566,21 @@ export class BrowserSession {
         timeoutMs
       });
     } catch (error) {
-      throw await this.#teach(state, error, method, sessionId);
+      throw this.redact(await this.#teach(state, error, method, sessionId));
     }
     this.#observe(state, method, liveParams, result);
     if (method === "Page.captureScreenshot") this.#assertFits(result);
-    return result;
+    return this.redact(result);
+  }
+
+  /**
+   * Replace the browser's saved login values in `value` with labels, when
+   * it has saved logins; otherwise return `value` as is. Everything this
+   * session returns is already redacted; a tool calls this on its final
+   * output too (errors, logs).
+   */
+  redact<T>(value: T): T {
+    return this.#redact ? this.#redact(value) : value;
   }
 
   /**
@@ -579,7 +615,9 @@ export class BrowserSession {
       DEBUG_LOG_SCHEMA,
       input
     ) as BrowserDebugLogInput;
-    return (await this.#connect()).connected.cdp.getDebugLog(limit);
+    return this.redact(
+      (await this.#connect()).connected.cdp.getDebugLog(limit)
+    );
   }
 
   /** Forget the CDP traffic recorded so far. */
@@ -620,6 +658,7 @@ export class BrowserSession {
         if (active && state.activeResolved) {
           await this.#recordSharedTab(state, active);
         }
+        await this.#closeLogins(state);
       } finally {
         state.connected.cdp.disconnect();
       }
@@ -648,6 +687,35 @@ export class BrowserSession {
       this.#connecting = undefined;
     });
     return this.#connecting;
+  }
+
+  /** The browser's saved logins, behind this session's admission check. */
+  #sessionLogins() {
+    const logins = this.#browser.logins;
+    return logins && { logins, admit: () => this.#admit() };
+  }
+
+  /**
+   * Capture rotated cookies of saved sites again, and say which saved logins
+   * a restarted browser was signed in to.
+   */
+  async #closeLogins(state: ConnectedState): Promise<void> {
+    const logins = this.#browser.logins;
+    if (!logins) return;
+    try {
+      await logins.refresh(state.connected.cdp, state.connected.sessionId);
+    } catch (error) {
+      this.#warn("refresh saved logins", error);
+    }
+    if (!state.report.restarted) return;
+    try {
+      const restored = (await logins.status())
+        .filter((site) => site.signedIn)
+        .map((site) => site.label);
+      if (restored.length > 0) state.report.restoredLogins = restored;
+    } catch (error) {
+      this.#warn("list saved logins", error);
+    }
   }
 
   /** The browser's internal hosts, behind this session's admission check. */
@@ -728,6 +796,14 @@ export class BrowserSession {
         tabShared: false
       }
     };
+    if (this.#browser.logins && !this.#redact) {
+      try {
+        this.#redact = await this.#browser.logins.redactor();
+      } catch (error) {
+        connected.cdp.disconnect();
+        throw error;
+      }
+    }
     if (this.#closed) {
       // Closed while connecting: close() is waiting on this state.
       return state;

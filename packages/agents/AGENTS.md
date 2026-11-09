@@ -204,6 +204,7 @@ src/
     providers/          # browserRun() + its adapter; provider-adapter.ts is the internal seam Browser calls
     connector.ts        # deprecated BrowserConnector — codemode connector + session helpers
     session-store.ts    # Durable session-id store + sweep
+    logins.ts           # Saved logins: encrypted per-agent cookies + localStorage, restored on connect, refused/redacted for model code
     live-view.ts        # Live View URL minting shared by Browser and BrowserConnector
     spec.ts             # CDP protocol spec loader (cdp.spec())
     quick-actions.ts    # Stateless Quick Action primitives (browserMarkdown, …)

@@ -818,4 +818,107 @@ describe("browser connector e2e", () => {
       expect(output.result).not.toBe("lost");
     });
   });
+
+  describe("saved logins", () => {
+    const ACME = "http://acme.localhost:18798";
+
+    interface ToolOutput {
+      status: "completed" | "error";
+      result?: unknown;
+      error?: string;
+      notice?: string;
+    }
+    const tool = async (code: string) =>
+      (await callAgent("loginsRun", [code])) as ToolOutput;
+
+    /** Model code: open `path` on Acme and evaluate `expression` there. */
+    const onAcme = (path: string, expression: string) => `async () => {
+      await browser.cdp({ method: "Page.navigate", params: { url: "${ACME}${path}" }, sessionId: "active" });
+      for (let i = 0; i < 50; i++) {
+        const { result } = await browser.cdp({ method: "Runtime.evaluate", params: { expression: "location.pathname + ' ' + document.readyState", returnByValue: true }, sessionId: "active" });
+        if (result.value === "${path} complete") break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const { result } = await browser.cdp({ method: "Runtime.evaluate", params: { expression: ${JSON.stringify(expression)}, returnByValue: true }, sessionId: "active" });
+      return result.value;
+    }`;
+    const whoami = () =>
+      tool(onAcme("/me", "server.textContent + ' / ' + client.textContent"));
+
+    afterAll(async () => {
+      await callAgent("loginsRevoke", ["acme"]);
+      await callAgent("loginsClose");
+    });
+
+    it("signs the agent's browser in only after the person saves", async () => {
+      const loginId = (await callAgent("loginsBegin", ["acme"])) as string;
+      expect(await callAgent("loginsSignIn", [loginId, "alice"])).toContain(
+        "Signed in as alice"
+      );
+
+      // The person is signed in, in a browser the model isn't connected to.
+      expect((await whoami()).result).toBe("Not signed in / no token");
+
+      await callAgent("loginsSave", [loginId]);
+
+      // The HttpOnly cookie and the localStorage token both came across.
+      expect((await whoami()).result).toBe(
+        "Signed in as alice / token present"
+      );
+    });
+
+    it("keeps the values from the model", async () => {
+      expect((await tool(onAcme("/me", "document.cookie"))).result).toBe("");
+      expect(
+        (await tool(onAcme("/me", "localStorage.getItem('api_token')"))).result
+      ).toBe("[saved acme localStorage api_token]");
+
+      const cookies = await tool(`async () =>
+        browser.cdp({ method: "Storage.getCookies" })`);
+      expect(cookies.status).toBe("error");
+      expect(cookies.error).toContain("Storage.getCookies is not available");
+
+      const logins = await tool("async () => browser.listLogins()");
+      expect(logins.result).toEqual([
+        {
+          site: "acme",
+          label: "Acme",
+          url: `${ACME}/login`,
+          signedIn: true
+        }
+      ]);
+    });
+
+    it("signs a replaced browser in again, and says so", async () => {
+      await callAgent("loginsLoseBrowser");
+      const output = await whoami();
+      expect(output.result).toBe("Signed in as alice / token present");
+      expect(output.notice).toContain(
+        "signed in again to the saved logins (Acme)"
+      );
+    });
+
+    it("keeps a rotated session cookie across a restart", async () => {
+      const [before] = (await callAgent("loginsList")) as {
+        refreshedAt: number;
+      }[];
+      expect(
+        (await tool(onAcme("/rotate", "document.body.innerText"))).result
+      ).toBe("rotated");
+      const [after] = (await callAgent("loginsList")) as {
+        refreshedAt: number;
+      }[];
+      expect(after!.refreshedAt).toBeGreaterThan(before!.refreshedAt);
+
+      await callAgent("loginsLoseBrowser");
+      expect((await whoami()).result).toBe(
+        "Signed in as alice / token present"
+      );
+    });
+
+    it("signs the browser out when the person revokes", async () => {
+      expect(await callAgent("loginsRevoke", ["acme"])).toBe(true);
+      expect((await whoami()).result).toBe("Not signed in / no token");
+    });
+  });
 });

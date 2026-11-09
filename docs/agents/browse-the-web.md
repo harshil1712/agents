@@ -278,6 +278,45 @@ export class MyObject extends DurableObject<Env> {
 
 `InternalHostRouter` reaches your Durable Object by calling its `fetchInternalHost()` method. With more than one `Browser`, pick the one named by `message.browser`. Without the method, the browser shows a 502 that says what to add. `Agent` has the method built in, so on an agent leave it out.
 
+### Saved logins
+
+A browser's logins last only as long as the browser: when it expires, crashes, or is closed, the next one starts signed out. Saved logins keep them. A person signs in to a site once, through Live View, and every new browser is signed in again before the model's code runs:
+
+```ts
+browser = new Browser({
+  provider: browserRun(this.env.BROWSER, {
+    guardrails: {
+      allowedDomains: ["github.com", "*.github.com", "*.githubassets.com"]
+    }
+  }),
+  logins: {
+    encryptionKey: this.env.BROWSER_LOGINS_KEY, // a Worker secret, at least 32 characters
+    sites: {
+      github: { label: "GitHub", loginUrl: "https://github.com/login" }
+    }
+  }
+});
+```
+
+Then, from your own code, never the model's:
+
+```ts
+// Opens a separate browser on the login page, with Live View links for the person
+const { loginId, liveView } = await this.browser.logins!.begin("github");
+// ...the person signs in through Live View, then tells your app they're done...
+await this.browser.logins!.save(loginId);
+```
+
+- `begin(site)` starts a browser of its own that model code never connects to. `liveView(loginId)` mints fresh links, `connect(loginId)` gives host code a CDP connection to sign in for the person, and `cancel(loginId)` closes it without saving.
+- `save(loginId)` captures the cookies the browser sends to the site's `origins` (by default, the origin of `loginUrl`) and their localStorage, then closes the login browser. It throws if the site set no cookies.
+- `list()` returns the saved logins without their values, and `revoke(site)` forgets one and closes the browser that has it.
+- Logins are encrypted with a key derived from `encryptionKey` and the agent's class, name, and browser name, so a saved login copied to another agent does not decrypt. Changing `encryptionKey` makes saved logins unreadable. Each Durable Object has its own, so name it from the authenticated user.
+- When a browser session closes, cookies of the sites already saved are captured again, so tokens the site rotates survive a restart. A login the model makes itself is never saved.
+- On a browser with saved logins, the model's `browser` global gains `listLogins()`, and its `notice` lists the logins a new browser was signed in to again.
+- The model cannot read or change cookies and storage: the `Storage` and `Network` cookie commands, `Storage.clearData*`, `DOMStorage`, `IndexedDB`, and `CacheStorage` are refused. Saved values that reach the model some other way, such as a page printing its own token, come back as placeholders like `[saved github cookie user_session]`.
+- Redaction only catches values as saved: page code can transform one first (`btoa(token)`). Set `guardrails` so the browser cannot send a value anywhere else.
+- Saving needs the `Browser` installed with `Lifecycle.use()`. IndexedDB is not saved.
+
 ## Session recording
 
 [Session recording](https://developers.cloudflare.com/browser-run/features/session-recording/) captures everything the agent did so you can review it afterward: an [rrweb](https://github.com/rrweb-io/rrweb) capture of DOM changes, input, and navigation (structured JSON, not video). Turn it on with `browserRun(binding, { recording: true })`. A recording is finalized when the browser closes, so note the session id while the browser is alive and fetch the recording later:
@@ -340,6 +379,7 @@ Recent Wrangler releases support Browser Run in local development. `npx wrangler
 - The model cannot close or crash the browser; `Browser.close` and `Browser.crash*` are refused.
 - The model cannot get a Live View link: `Cloudflare.getLiveView` and `Cloudflare.handoff` are refused, and so are `Target.sendMessageToTarget` and `Target.exposeDevToolsProtocol`, which could carry those commands inside them.
 - Live View links give whoever holds them control of the browser, including its logins. Do not show them to the model or store them.
+- On a browser with [saved logins](#saved-logins), the model cannot use cookie or storage commands, and saved values are redacted from everything it gets back. Redaction is best effort; `guardrails` are what stop a value from leaving.
 
 # Deprecated
 

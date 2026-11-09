@@ -1,4 +1,4 @@
-import { Agent, callable, routeAgentRequest } from "agents";
+import { Agent, callable, routeAgentRequest, type AgentContext } from "agents";
 import {
   CodemodeConnector,
   createCodemodeRuntime,
@@ -13,6 +13,13 @@ import { browserFunctions } from "../browser/browser-functions";
 import { runBrowserCode } from "../browser/sandbox";
 import type { BrowserSessionReport } from "../browser/session";
 import { Browser, namedBrowserSessionKey } from "../browser/browser";
+// The saved-logins browser is installed on the Agent's Lifecycle, so it must
+// come from the same build as `Agent` (the package's dist), not `src`.
+import {
+  Browser as LifecycleBrowser,
+  browserRun as lifecycleBrowserRun
+} from "agents/browser";
+import { browserTool } from "agents/browser/ai-sdk";
 import { browserRun } from "../browser/providers/browser-run";
 import {
   DurableBrowserSessionStore,
@@ -40,6 +47,15 @@ type SessionMode = "one-shot" | "reuse" | "dynamic";
 /** The named session the persistent-browser tests drive. */
 const NAMED_SESSION = "e2e";
 
+/** Test-only key for the saved-logins browser. Real keys come from secrets. */
+const LOGINS_TEST_KEY = "browser-e2e-saved-logins-test-key-0123456789";
+
+/**
+ * Where the fake Acme site is served. Chrome resolves *.localhost to
+ * loopback, so the local browser reaches this `wrangler dev`.
+ */
+const ACME_ORIGIN = "http://acme.localhost:18798";
+
 /** Approval-gated connector used to pause executions mid-run in tests. */
 class GateConnector extends CodemodeConnector<Env> {
   name(): string {
@@ -62,6 +78,21 @@ class GateConnector extends CodemodeConnector<Env> {
 }
 
 export class BrowserTestAgent extends Agent<Env> {
+  /** A browser with saved logins for the fake Acme site. */
+  readonly loginsBrowser = new LifecycleBrowser({
+    name: "logins",
+    provider: lifecycleBrowserRun(this.env.BROWSER),
+    logins: {
+      encryptionKey: LOGINS_TEST_KEY,
+      sites: { acme: { label: "Acme", loginUrl: `${ACME_ORIGIN}/login` } }
+    }
+  });
+
+  constructor(ctx: AgentContext, env: Env) {
+    super(ctx, env);
+    this.lifecycle.use(this.loginsBrowser);
+  }
+
   #store() {
     return new DurableBrowserSessionStore(this.ctx.storage);
   }
@@ -139,6 +170,104 @@ export class BrowserTestAgent extends Agent<Env> {
       // Already closed unless the run threw; a second close does nothing.
       await session.close();
     }
+  }
+
+  // ── Saved logins ──
+
+  #logins() {
+    const logins = this.loginsBrowser.logins;
+    if (!logins) throw new Error("no saved logins");
+    return logins;
+  }
+
+  @callable()
+  async loginsBegin(site: string) {
+    const { loginId } = await this.#logins().begin(site);
+    return loginId;
+  }
+
+  /**
+   * Stand in for the person in Live View: type into the login browser over
+   * a host-side connection the model never has.
+   */
+  @callable()
+  async loginsSignIn(loginId: string, username: string): Promise<string> {
+    const cdp = await this.#logins().connect(loginId);
+    const evaluate = async (expression: string) =>
+      (
+        (await cdp.send(
+          "Runtime.evaluate",
+          { expression, returnByValue: true },
+          { sessionId }
+        )) as { result?: { value?: unknown } }
+      ).result?.value;
+    let sessionId: string | undefined;
+    try {
+      const { targetInfos } = (await cdp.send("Target.getTargets")) as {
+        targetInfos: { targetId: string; type: string; url: string }[];
+      };
+      const tab = targetInfos.find((t) => t.url.startsWith(ACME_ORIGIN));
+      if (!tab) throw new Error("login tab not found");
+      sessionId = await cdp.attachToTarget(tab.targetId);
+      for (let i = 0; i < 50 && !(await evaluate("!!document.forms[0]")); i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      await evaluate(
+        `document.forms[0].username.value = ${JSON.stringify(username)}; document.forms[0].password.value = "hunter2"; document.forms[0].submit(); true`
+      );
+      for (let i = 0; i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        const text = await evaluate(
+          `location.pathname === "/me" && document.readyState === "complete" ? document.body.innerText : ""`
+        ).catch(() => "");
+        if (text) return String(text);
+      }
+      throw new Error("sign-in did not finish");
+    } finally {
+      cdp.disconnect();
+    }
+  }
+
+  @callable()
+  async loginsSave(loginId: string) {
+    return this.#logins().save(loginId);
+  }
+
+  @callable()
+  async loginsList() {
+    return this.#logins().list();
+  }
+
+  @callable()
+  async loginsRevoke(site: string) {
+    return this.#logins().revoke(site);
+  }
+
+  /** Run model code through `browserTool`, exactly as the model would. */
+  @callable()
+  async loginsRun(code: string) {
+    return browserTool({
+      browser: this.loginsBrowser,
+      loader: this.env.LOADER
+    }).execute({ code }, {});
+  }
+
+  /** Simulate Browser Run reclaiming the logins browser. */
+  @callable()
+  async loginsLoseBrowser(): Promise<void> {
+    const store = this.#store();
+    const key = namedBrowserSessionKey("logins");
+    const stored = await store.get(key);
+    if (!stored) throw new Error("no logins browser yet");
+    await store.set(key, {
+      ...stored,
+      sessionId: "00000000-0000-0000-0000-000000000000"
+    });
+  }
+
+  @callable()
+  async loginsClose(): Promise<void> {
+    await this.loginsBrowser.close();
   }
 
   /** Close the persistent browser so it doesn't outlive the suite. */
@@ -261,8 +390,57 @@ export class BrowserTestAgent extends Agent<Env> {
   }
 }
 
+/**
+ * The fake Acme site: a sign-in form that sets an HttpOnly session cookie
+ * and a localStorage token, `/me` that checks both, and `/rotate` that
+ * replaces the session cookie like real sites do.
+ */
+async function acmeSite(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const html = (body: string, headers: HeadersInit = {}) =>
+    new Response(`<!doctype html><html><body>${body}</body></html>`, {
+      headers: { "Content-Type": "text/html", ...headers }
+    });
+  const user = /(?:^|;\s*)sid=sid_([a-z]+)_/.exec(
+    request.headers.get("Cookie") ?? ""
+  )?.[1];
+  const sessionCookie = (name: string) =>
+    `sid=sid_${name}_${crypto.randomUUID().replaceAll("-", "")}; Path=/; HttpOnly; SameSite=Lax`;
+  switch (`${request.method} ${url.pathname}`) {
+    case "GET /robots.txt":
+      return new Response("User-agent: *\n");
+    case "GET /login":
+      return html(
+        `<form method="POST" action="/login"><input name="username"><input name="password" type="password"><button>Sign in</button></form>`
+      );
+    case "POST /login": {
+      const form = await request.formData();
+      const name = String(form.get("username"));
+      if (!/^[a-z]+$/.test(name) || form.get("password") !== "hunter2") {
+        return html("wrong password");
+      }
+      return html(
+        `<script>localStorage.setItem("api_token", "tok_${name}_${crypto.randomUUID()}"); location.href = "/me";</script>`,
+        { "Set-Cookie": sessionCookie(name) }
+      );
+    }
+    case "GET /rotate":
+      return user
+        ? html("rotated", { "Set-Cookie": sessionCookie(user) })
+        : html("not signed in");
+    case "GET /me":
+      return html(
+        `<p id="server">${user ? `Signed in as ${user}` : "Not signed in"}</p><p id="client"></p><script>document.getElementById("client").textContent = localStorage.getItem("api_token") ? "token present" : "no token";</script>`
+      );
+  }
+  return new Response("Not found", { status: 404 });
+}
+
 export default {
   async fetch(request: Request, env: Env) {
+    if (new URL(request.url).hostname === "acme.localhost") {
+      return acmeSite(request);
+    }
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
