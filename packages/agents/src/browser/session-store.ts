@@ -23,6 +23,12 @@ export interface StoredBrowserSession {
    * so a record made with different hostnames is replaced.
    */
   internalHosts?: string;
+  /**
+   * Named browser records only: the saved-logins version applied to this
+   * session. A replaced browser's record starts without it, so the next
+   * connect applies the saved logins again.
+   */
+  loginsVersion?: number;
 }
 
 export interface BrowserSessionLock {

@@ -194,6 +194,275 @@ export function createFakeBrowserBinding(
   };
 }
 
+export interface FakeCookie {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expires: number;
+  httpOnly: boolean;
+  secure: boolean;
+  session: boolean;
+  sameSite?: string;
+}
+
+export interface FakeSession {
+  dead: boolean;
+  cookies: FakeCookie[];
+  /** origin → key → value */
+  localStorage: Map<string, Map<string, string>>;
+  /** targetId → url */
+  tabs: Map<string, string>;
+  /** CDP session id → targetId */
+  attached: Map<string, string>;
+  /** Every command sent on any socket to this session, in order. */
+  commands: { method: string; params?: Record<string, unknown> }[];
+}
+
+/**
+ * An in-memory Browser Run for saved-logins tests: each session's sockets
+ * share a cookie jar, per-origin localStorage, and tabs with URLs, like one
+ * real browser. Every command is recorded per session, so tests can check
+ * what ran before the caller's first command. DELETE kills a session, and
+ * pages on an origin in `unreachable` fail to evaluate, like a host that
+ * doesn't resolve.
+ */
+export function createSavedLoginsFakeBinding() {
+  const sessions = new Map<string, FakeSession>();
+  const unreachable = new Set<string>();
+  let created = 0;
+
+  const session = (id: string) => {
+    const found = sessions.get(id);
+    if (!found) throw new Error(`no fake session ${id}`);
+    return found;
+  };
+
+  const originOf = (url: string) => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return "null";
+    }
+  };
+
+  function handle(
+    s: FakeSession,
+    method: string,
+    params: Record<string, unknown> = {},
+    cdpSession?: string
+  ): unknown {
+    s.commands.push({ method, params });
+    const tabUrl = () => s.tabs.get(s.attached.get(cdpSession ?? "") ?? "");
+    switch (method) {
+      case "Target.getTargets":
+        return {
+          targetInfos: [...s.tabs].map(([targetId, url]) => ({
+            targetId,
+            type: "page",
+            url
+          }))
+        };
+      case "Target.createTarget": {
+        const targetId = `tab-${s.tabs.size + 1}-${Math.random().toString(36).slice(2, 6)}`;
+        s.tabs.set(targetId, String(params.url ?? "about:blank"));
+        return { targetId };
+      }
+      case "Target.closeTarget":
+        s.tabs.delete(String(params.targetId));
+        return { success: true };
+      case "Target.attachToTarget": {
+        const id = `cdp-${String(params.targetId)}`;
+        s.attached.set(id, String(params.targetId));
+        return { sessionId: id };
+      }
+      case "Page.navigate": {
+        const targetId = s.attached.get(cdpSession ?? "");
+        if (targetId) s.tabs.set(targetId, String(params.url));
+        return { frameId: "frame" };
+      }
+      case "Storage.getCookies":
+      case "Network.getAllCookies":
+        return { cookies: s.cookies.map((c) => ({ ...c })) };
+      case "Storage.setCookies":
+        for (const c of params.cookies as Record<string, unknown>[]) {
+          const domain = c.url
+            ? new URL(String(c.url)).hostname
+            : String(c.domain);
+          s.cookies = s.cookies.filter(
+            (o) => !(o.name === c.name && o.domain === domain)
+          );
+          s.cookies.push({
+            name: String(c.name),
+            value: String(c.value),
+            domain,
+            path: String(c.path ?? "/"),
+            expires: Number(c.expires ?? -1),
+            httpOnly: Boolean(c.httpOnly),
+            secure: Boolean(c.secure),
+            session: c.expires === undefined
+          });
+        }
+        return {};
+      case "Runtime.evaluate": {
+        const expression = String(params.expression);
+        const url = tabUrl() ?? "about:blank";
+        const origin = originOf(url);
+        if (unreachable.has(origin)) {
+          return {
+            result: {},
+            exceptionDetails: { text: "net::ERR_NAME_NOT_RESOLVED" }
+          };
+        }
+        const store =
+          s.localStorage.get(origin) ??
+          s.localStorage.set(origin, new Map()).get(origin)!;
+        if (expression === "location.origin + ' ' + document.readyState") {
+          return { result: { value: `${origin} complete` } };
+        }
+        if (expression === "JSON.stringify({ ...localStorage })") {
+          return {
+            result: { value: JSON.stringify(Object.fromEntries(store)) }
+          };
+        }
+        const write = expression.match(/const items = (\{.*?\}); for/);
+        if (write) {
+          for (const [k, v] of Object.entries(
+            JSON.parse(write[1]) as Record<string, string>
+          )) {
+            store.set(k, v);
+          }
+          return { result: { value: true } };
+        }
+        const get = expression.match(/^localStorage\.getItem\("(.+)"\)$/);
+        if (get) return { result: { value: store.get(get[1]) ?? null } };
+        if (expression === "document.cookie") {
+          const host = new URL(url).hostname;
+          return {
+            result: {
+              value: s.cookies
+                .filter((c) => !c.httpOnly && c.domain === host)
+                .map((c) => `${c.name}=${c.value}`)
+                .join("; ")
+            }
+          };
+        }
+        if (expression === "throw:saved") {
+          return {
+            result: {},
+            exceptionDetails: { text: `Uncaught ${store.get("token")}` }
+          };
+        }
+        return { result: { value: `evaluated ${expression}` } };
+      }
+      default:
+        return {};
+    }
+  }
+
+  class Socket {
+    #listeners = new Map<string, ((event: unknown) => void)[]>();
+    constructor(readonly sessionId: string) {}
+    accept() {}
+    send(data: string) {
+      const { id, method, params, sessionId } = JSON.parse(data) as {
+        id: number;
+        method: string;
+        params?: Record<string, unknown>;
+        sessionId?: string;
+      };
+      const result = handle(session(this.sessionId), method, params, sessionId);
+      queueMicrotask(() => {
+        for (const fn of this.#listeners.get("message") ?? []) {
+          fn({ data: JSON.stringify({ id, result }) });
+        }
+      });
+    }
+    addEventListener(type: string, fn: (event: unknown) => void) {
+      this.#listeners.set(type, [...(this.#listeners.get(type) ?? []), fn]);
+    }
+    close() {
+      for (const fn of this.#listeners.get("close") ?? []) fn({});
+    }
+  }
+
+  const browser: BrowserBinding = {
+    async fetch(input, init) {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const id = url.match(/\/browser\/([^/?]+)/)?.[1];
+      if (new Headers(init?.headers).get("Upgrade") === "websocket") {
+        if (!id || session(id).dead) {
+          return new Response(null, { status: 410 });
+        }
+        const response = new Response(null);
+        Object.defineProperty(response, "webSocket", { value: new Socket(id) });
+        return response;
+      }
+      if (method === "POST") {
+        const sessionId = `session-${++created}`;
+        sessions.set(sessionId, {
+          dead: false,
+          cookies: [],
+          localStorage: new Map(),
+          tabs: new Map([["tab-0", "about:blank"]]),
+          attached: new Map(),
+          commands: []
+        });
+        return Response.json({ sessionId });
+      }
+      if (url.endsWith("/json/list")) {
+        if (!id || session(id).dead) return new Response(null, { status: 410 });
+        return Response.json(
+          [...session(id).tabs].map(([targetId, tabUrl]) => ({
+            id: targetId,
+            type: "page",
+            url: tabUrl,
+            devtoolsFrontendUrl: `https://live.browser.run/${id}/${targetId}`
+          }))
+        );
+      }
+      if (method === "DELETE" && id) session(id).dead = true;
+      return new Response(null, { status: 204 });
+    }
+  };
+
+  return {
+    browser,
+    sessions,
+    session,
+    /** Origins whose pages fail to evaluate. */
+    unreachable,
+    /** The person signs in inside a login browser. */
+    signIn(
+      sessionId: string,
+      cookies: Partial<FakeCookie>[],
+      localStorage: Record<string, Record<string, string>> = {}
+    ) {
+      const s = session(sessionId);
+      for (const c of cookies) {
+        s.cookies.push({
+          name: "sid",
+          value: "",
+          domain: "acme.test",
+          path: "/",
+          expires: -1,
+          httpOnly: true,
+          secure: true,
+          session: true,
+          ...c
+        });
+      }
+      for (const [origin, items] of Object.entries(localStorage)) {
+        s.localStorage.set(origin, new Map(Object.entries(items)));
+      }
+    },
+    kill: (sessionId: string) => {
+      session(sessionId).dead = true;
+    }
+  };
+}
+
 /**
  * Minimal real host for capability-level browser tests: a Durable Object
  * whose only capability is a `Browser`, with runtime handlers

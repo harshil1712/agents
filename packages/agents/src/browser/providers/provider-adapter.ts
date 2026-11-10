@@ -48,6 +48,13 @@ export interface BrowserProviderAdapter {
   create(context?: { owner?: InternalHostOwner }): Promise<{
     sessionId: string;
   }>;
+  /**
+   * Start a separate browser for a person to sign in with (saved logins),
+   * without the provider's recording, guardrails or internal hostnames.
+   */
+  createLoginSession(options: {
+    keepAliveMs: number;
+  }): Promise<{ sessionId: string }>;
   /** The provider's internal hostnames, when it has any. */
   readonly internalHosts?: InternalHostsOptions;
   /**

@@ -46,6 +46,16 @@ export {
   type ResolvedBrowser
 } from "./browser";
 
+export type {
+  BrowserLogins,
+  BrowserSessionLogins,
+  SavedLoginInfo,
+  SavedLoginSite,
+  SavedLoginStart,
+  SavedLoginStatus,
+  SavedLoginsOptions
+} from "./logins";
+
 export { DEFAULT_BROWSER_SCOPE, conversationScope } from "./scope";
 
 export type { BrowserFunction, BrowserFunctionDocs } from "./browser-functions";

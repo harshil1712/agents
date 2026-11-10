@@ -13,6 +13,7 @@
  */
 import type { BrowserInternalHosts } from "./browser";
 import type { InternalHostInfo } from "./internal-hosts";
+import type { BrowserSessionLogins } from "./logins";
 import type {
   BrowserAttachInput,
   BrowserDebugLogInput,
@@ -214,13 +215,26 @@ function hostsFunctions(
 }
 
 /**
+ * The saved logins a session's functions use, and the session's admission
+ * check, as for {@link SessionHosts}.
+ */
+export interface SessionLogins {
+  logins: BrowserSessionLogins;
+  admit(): Promise<void>;
+}
+
+const LIST_LOGINS_DOC =
+  "`browser.listLogins()` returns each site under Saved logins as `{ site, label, url, signedIn }`. When `signedIn` is true the browser is already signed in there: just navigate.";
+
+/**
  * The `browser` object's functions, bound to one run's session, plus the
  * hosts functions when the browser has internal hostnames. Each hosts
  * function checks its input, then waits for `admit`, then calls the hosts.
  */
 export function browserFunctions(
   session: BrowserSession,
-  sessionHosts?: SessionHosts
+  sessionHosts?: SessionHosts,
+  sessionLogins?: SessionLogins
 ): Record<string, BrowserFunction> {
   const functions: Record<string, BrowserFunction> = Object.fromEntries(
     Object.entries(BROWSER_FUNCTIONS).map(([name, definition]) => [
@@ -237,6 +251,13 @@ export function browserFunctions(
         return definition.call(hosts, input);
       };
     }
+  }
+  if (sessionLogins) {
+    const { logins, admit } = sessionLogins;
+    functions.listLogins = async () => {
+      await admit();
+      return logins.status();
+    };
   }
   return functions;
 }
@@ -255,33 +276,58 @@ function describeHost(info: InternalHostInfo): string {
  * `hosts`, and the rules.
  */
 export function browserFunctionDocs(
-  hosts?: BrowserInternalHosts
+  hosts?: BrowserInternalHosts,
+  logins?: BrowserSessionLogins
 ): BrowserFunctionDocs {
-  return { functions: functionsMarkdown(hosts), rules: [...BROWSER_RULES] };
+  return {
+    functions: functionsMarkdown(hosts, logins),
+    rules: [...BROWSER_RULES, ...(logins ? LOGINS_RULES : [])]
+  };
 }
 
 /**
  * The functions in Markdown: one line per function, then the internal sites
  * when the browser has any.
  */
-function functionsMarkdown(hosts?: BrowserInternalHosts): string {
+function functionsMarkdown(
+  hosts?: BrowserInternalHosts,
+  logins?: BrowserSessionLogins
+): string {
   const infos = hosts?.describe() ?? [];
   const functions = [
     ...Object.values(BROWSER_FUNCTIONS),
-    ...(hosts ? hostsFunctions(infos).map(([, definition]) => definition) : [])
+    ...(hosts ? hostsFunctions(infos).map(([, definition]) => definition) : []),
+    ...(logins ? [{ doc: LIST_LOGINS_DOC }] : [])
   ];
-  const lines = functions.map((definition) => `- ${definition.doc}`);
-  if (!hosts) return lines.join("\n");
-  return [
-    ...lines,
-    "",
-    "## Internal sites",
-    "",
-    "The browser can open these sites, which aren't on the public internet. Plain http only: no https:// and no WebSockets, so a dev server's hot reload won't connect; reload the page instead.",
-    "",
-    ...infos.map(describeHost)
-  ].join("\n");
+  const sections = [functions.map((definition) => `- ${definition.doc}`)];
+  if (hosts) {
+    sections.push([
+      "## Internal sites",
+      "",
+      "The browser can open these sites, which aren't on the public internet. Plain http only: no https:// and no WebSockets, so a dev server's hot reload won't connect; reload the page instead.",
+      "",
+      ...infos.map(describeHost)
+    ]);
+  }
+  if (logins) {
+    sections.push([
+      "## Saved logins",
+      "",
+      "The user can sign the browser in to these sites. `browser.listLogins()` says which are signed in now.",
+      "",
+      ...logins
+        .describe()
+        .map(({ site, label, url }) => `- \`${site}\` — ${label} (${url})`)
+    ]);
+  }
+  return sections.map((lines) => lines.join("\n")).join("\n\n");
 }
+
+/** The rules for a browser with saved logins. */
+const LOGINS_RULES: readonly string[] = [
+  "Only the user signs in to a site under Saved logins: never ask for, type, or guess its password. If it isn't signed in, ask the user to sign in.",
+  "Cookie and storage commands (Storage.getCookies, Network.getCookies, DOMStorage.*, IndexedDB.*) are refused, and saved values read from a page come back as placeholders like [saved github cookie user_session]. The browser is already signed in; don't work around it."
+];
 
 /**
  * How to use the browser, one rule per line. Each rule fixes a mistake

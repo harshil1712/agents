@@ -148,7 +148,10 @@ export function createBrowserToolCore(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   // The source's own hosts, so custom sources need nothing beyond
   // `BrowserSource`; a `Browser`'s `functionDocs()` returns the same.
-  const docs = browserFunctionDocs(options.browser.internalHosts);
+  const docs = browserFunctionDocs(
+    options.browser.internalHosts,
+    options.browser.logins
+  );
   const rules = [
     ...docs.rules,
     "Results over about 24,000 characters are cut short.",
@@ -229,7 +232,9 @@ export function createBrowserToolCore(
     const notice = [output.notice, ...(report?.notices ?? [])]
       .filter(Boolean)
       .join(" ");
-    return { ...output, ...(notice ? { notice } : {}) };
+    // Results are redacted as the session returns them; this also covers
+    // what the code logged or threw.
+    return session.redact({ ...output, ...(notice ? { notice } : {}) });
   }
 
   return {
